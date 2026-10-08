@@ -1,0 +1,430 @@
+#!/bin/bash
+
+set -u
+
+DNSCRYPT_DIR="/opt/dnscrypt-proxy"
+DNSCRYPT_TAR="/tmp/dnscrypt-proxy.tar.gz"
+DNSCRYPT_SERVICE="/etc/systemd/system/dnscrypt-proxy.service"
+
+DOH_HOST="cloudflare-dns.com"
+DOH_IP="1.1.1.1"
+
+log() {
+    echo
+    echo "[+] $*"
+}
+
+die() {
+    echo
+    echo "[!] ERROR: $*" >&2
+    exit 1
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die "Jalankan sebagai root."
+}
+
+command -v curl >/dev/null 2>&1 || die "curl tidak tersedia."
+command -v tar >/dev/null 2>&1 || die "tar tidak tersedia."
+
+require_root
+
+echo "=============================================="
+echo " DNS FIX / DNSCrypt Proxy"
+echo " CentOS/RHEL compatible"
+echo "=============================================="
+
+ARCH="$(uname -m)"
+
+case "$ARCH" in
+    x86_64)
+        DNSCRYPT_ARCH="linux_x86_64"
+        ;;
+    aarch64|arm64)
+        DNSCRYPT_ARCH="linux_arm64"
+        ;;
+    *)
+        die "Arsitektur tidak didukung: $ARCH"
+        ;;
+esac
+
+# ------------------------------------------------
+# Resolve hostname menggunakan Cloudflare DoH
+# ------------------------------------------------
+
+doh_resolve() {
+    local HOST="$1"
+
+    curl -4 -fsS \
+        --resolve "${DOH_HOST}:443:${DOH_IP}" \
+        --connect-timeout 5 \
+        --max-time 15 \
+        "https://${DOH_HOST}/dns-query?name=${HOST}&type=A" \
+        -H 'accept: application/dns-json' |
+        grep -o '"data":"[0-9.]*"' |
+        head -1 |
+        sed 's/.*"data":"//;s/".*//'
+}
+
+# ------------------------------------------------
+# Download URL tanpa DNS normal
+# ------------------------------------------------
+
+download_with_bypass() {
+    local URL="$1"
+    local OUTPUT="$2"
+
+    local HOST
+    local IP
+    local REDIRECT_HOST
+    local REDIRECT_IP
+
+    HOST="$(echo "$URL" | sed -E 's#^https://([^/]+).*#\1#')"
+
+    [ -n "$HOST" ] || die "Tidak bisa mengambil hostname dari URL."
+
+    log "Resolving ${HOST} melalui Cloudflare DoH..."
+
+    IP="$(doh_resolve "$HOST")"
+
+    [ -n "$IP" ] || die "Gagal mendapatkan IP ${HOST}."
+
+    echo "    ${HOST} -> ${IP}"
+
+    # Ambil redirect
+    local HEADERS="/tmp/dnscrypt.headers"
+
+    rm -f "$HEADERS"
+
+    curl -4 \
+        --resolve "${HOST}:443:${IP}" \
+        -fsSIL \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -D "$HEADERS" \
+        "$URL" \
+        -o /dev/null || true
+
+    REDIRECT_HOST="$(
+        grep -i '^location:' "$HEADERS" |
+        tail -1 |
+        sed -E 's#^[Ll]ocation:[[:space:]]*https://([^/]+).*#\1#'
+    )"
+
+    # Tidak ada redirect
+    if [ -z "$REDIRECT_HOST" ]; then
+
+        log "Download langsung..."
+
+        curl -4 \
+            --resolve "${HOST}:443:${IP}" \
+            -fL \
+            --connect-timeout 10 \
+            --max-time 180 \
+            "$URL" \
+            -o "$OUTPUT"
+
+        return $?
+
+    fi
+
+    echo "    Redirect -> ${REDIRECT_HOST}"
+
+    REDIRECT_IP="$(doh_resolve "$REDIRECT_HOST")"
+
+    [ -n "$REDIRECT_IP" ] ||
+        die "Gagal resolve redirect host: ${REDIRECT_HOST}"
+
+    echo "    ${REDIRECT_HOST} -> ${REDIRECT_IP}"
+
+    curl -4 \
+        --resolve "${HOST}:443:${IP}" \
+        --resolve "${REDIRECT_HOST}:443:${REDIRECT_IP}" \
+        -fL \
+        --connect-timeout 10 \
+        --max-time 180 \
+        "$URL" \
+        -o "$OUTPUT"
+}
+
+# ------------------------------------------------
+# Cari latest release dnscrypt-proxy
+# ------------------------------------------------
+
+log "Mengambil release terbaru dnscrypt-proxy..."
+
+API_HOST="api.github.com"
+API_IP="$(doh_resolve "$API_HOST")"
+
+[ -n "$API_IP" ] || die "Tidak bisa resolve ${API_HOST}."
+
+echo "    ${API_HOST} -> ${API_IP}"
+
+RELEASE_JSON="/tmp/dnscrypt-release.json"
+
+curl -4 \
+    --resolve "${API_HOST}:443:${API_IP}" \
+    -fsSL \
+    --connect-timeout 10 \
+    --max-time 30 \
+    "https://${API_HOST}/repos/DNSCrypt/dnscrypt-proxy/releases/latest" \
+    -o "$RELEASE_JSON" ||
+    die "Gagal mengambil informasi release."
+
+# Ambil URL asset sesuai arsitektur
+ASSET_URL="$(
+    grep '"browser_download_url"' "$RELEASE_JSON" |
+    grep "${DNSCRYPT_ARCH}" |
+    grep '\.tar\.gz"' |
+    head -1 |
+    sed -E 's/.*"browser_download_url":[[:space:]]*"([^"]+)".*/\1/'
+)"
+
+[ -n "$ASSET_URL" ] ||
+    die "Asset dnscrypt-proxy ${DNSCRYPT_ARCH} tidak ditemukan."
+
+echo
+echo "Asset:"
+echo "$ASSET_URL"
+
+# ------------------------------------------------
+# Download
+# ------------------------------------------------
+
+log "Download dnscrypt-proxy..."
+
+rm -f "$DNSCRYPT_TAR"
+
+download_with_bypass "$ASSET_URL" "$DNSCRYPT_TAR" ||
+    die "Download dnscrypt-proxy gagal."
+
+[ -s "$DNSCRYPT_TAR" ] ||
+    die "File download kosong."
+
+log "Download berhasil."
+
+ls -lh "$DNSCRYPT_TAR"
+
+# ------------------------------------------------
+# Extract
+# ------------------------------------------------
+
+log "Install dnscrypt-proxy..."
+
+systemctl stop dnscrypt-proxy 2>/dev/null || true
+
+rm -rf "$DNSCRYPT_DIR"
+mkdir -p "$DNSCRYPT_DIR"
+
+tar -xzf "$DNSCRYPT_TAR" \
+    -C "$DNSCRYPT_DIR" \
+    --strip-components=1 ||
+    die "Gagal extract archive."
+
+[ -x "$DNSCRYPT_DIR/dnscrypt-proxy" ] ||
+    die "Binary dnscrypt-proxy tidak ditemukan."
+
+# ------------------------------------------------
+# Konfigurasi
+# ------------------------------------------------
+
+cd "$DNSCRYPT_DIR" || exit 1
+
+cp example-dnscrypt-proxy.toml dnscrypt-proxy.toml
+
+# Cari siapa yang menggunakan port 53
+PORT53_OWNER="$(ss -lntup 2>/dev/null | grep -E '(:53[[:space:]]|:53[[:space:]])' | grep -o 'users:(([^)]*' | head -1)"
+
+if ss -lntup 2>/dev/null | grep -q '127.0.0.1:53.*named\|172\.[0-9.]*:53.*named\|\[::\]:53.*named'; then
+
+    MODE="BIND"
+
+    log "BIND/named ditemukan pada port 53."
+
+    DNSCRYPT_PORT="5353"
+
+    sed -i \
+        "s|^listen_addresses =.*|listen_addresses = ['127.0.0.1:${DNSCRYPT_PORT}']|" \
+        "$DNSCRYPT_DIR/dnscrypt-proxy.toml"
+
+else
+
+    MODE="DIRECT"
+
+    DNSCRYPT_PORT="53"
+
+    sed -i \
+        "s|^listen_addresses =.*|listen_addresses = ['127.0.0.1:${DNSCRYPT_PORT}']|" \
+        "$DNSCRYPT_DIR/dnscrypt-proxy.toml"
+
+fi
+
+# Bootstrap melalui resolver internal yang sudah terbukti bekerja
+sed -i \
+    "s|^bootstrap_resolvers =.*|bootstrap_resolvers = ['172.31.31.187:53']|" \
+    "$DNSCRYPT_DIR/dnscrypt-proxy.toml"
+
+# Jangan mengambil resolver dari resolv.conf
+if grep -q '^ignore_system_dns' "$DNSCRYPT_DIR/dnscrypt-proxy.toml"; then
+    sed -i \
+        's|^ignore_system_dns =.*|ignore_system_dns = true|' \
+        "$DNSCRYPT_DIR/dnscrypt-proxy.toml"
+else
+    echo "ignore_system_dns = true" >> "$DNSCRYPT_DIR/dnscrypt-proxy.toml"
+fi
+
+echo
+echo "Mode          : $MODE"
+echo "DNSCrypt port : $DNSCRYPT_PORT"
+
+# ------------------------------------------------
+# Backup
+# ------------------------------------------------
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+if [ -f /etc/named.conf ]; then
+    cp -a /etc/named.conf \
+        "/etc/named.conf.bak.${STAMP}"
+fi
+
+if [ -f /etc/resolv.conf ]; then
+    cp -a /etc/resolv.conf \
+        "/etc/resolv.conf.bak.${STAMP}"
+fi
+
+# ------------------------------------------------
+# systemd
+# ------------------------------------------------
+
+log "Membuat systemd service..."
+
+cat > "$DNSCRYPT_SERVICE" <<EOF
+[Unit]
+Description=dnscrypt-proxy DNS resolver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${DNSCRYPT_DIR}
+ExecStart=${DNSCRYPT_DIR}/dnscrypt-proxy -config ${DNSCRYPT_DIR}/dnscrypt-proxy.toml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+# ------------------------------------------------
+# Kalau BIND, arahkan forwarder
+# ------------------------------------------------
+
+if [ "$MODE" = "BIND" ]; then
+
+    log "Mengkonfigurasi BIND -> dnscrypt-proxy..."
+
+    if grep -qE '^[[:space:]]*forwarders[[:space:]]*\{' /etc/named.conf; then
+
+        sed -i \
+            -E "s|^[[:space:]]*forwarders[[:space:]]*\{[^}]*\};|      forwarders { 127.0.0.1 port ${DNSCRYPT_PORT}; };|" \
+            /etc/named.conf
+
+    else
+
+        sed -i \
+            "/^[[:space:]]*forward only;/i\\      forwarders { 127.0.0.1 port ${DNSCRYPT_PORT}; };" \
+            /etc/named.conf
+
+    fi
+
+    named-checkconf /etc/named.conf ||
+        die "named.conf tidak valid. Backup tersedia di /etc/named.conf.bak.${STAMP}"
+
+fi
+
+# ------------------------------------------------
+# Start DNSCrypt
+# ------------------------------------------------
+
+log "Menjalankan dnscrypt-proxy..."
+
+systemctl enable dnscrypt-proxy >/dev/null 2>&1
+systemctl restart dnscrypt-proxy
+
+sleep 5
+
+if ! systemctl is-active --quiet dnscrypt-proxy; then
+
+    echo
+    echo "[!] dnscrypt-proxy gagal start."
+    journalctl -u dnscrypt-proxy -n 30 --no-pager
+
+    exit 1
+fi
+
+# ------------------------------------------------
+# Test dnscrypt
+# ------------------------------------------------
+
+log "Testing dnscrypt-proxy..."
+
+if command -v dig >/dev/null 2>&1; then
+
+    dig "@127.0.0.1" -p "$DNSCRYPT_PORT" google.com \
+        +time=5 +tries=1
+
+fi
+
+# ------------------------------------------------
+# Reload BIND
+# ------------------------------------------------
+
+if [ "$MODE" = "BIND" ]; then
+
+    log "Reload BIND..."
+
+    systemctl reload named ||
+        die "BIND gagal reload."
+
+fi
+
+# ------------------------------------------------
+# Set resolver lokal
+# ------------------------------------------------
+
+log "Menggunakan resolver lokal..."
+
+cat > /etc/resolv.conf <<EOF
+nameserver 127.0.0.1
+EOF
+
+# ------------------------------------------------
+# Final test
+# ------------------------------------------------
+
+log "Final DNS test..."
+
+dig google.com +time=5 +tries=1
+
+echo
+echo "=============================================="
+echo " DNS FIX SELESAI"
+echo "=============================================="
+echo
+echo "Mode              : $MODE"
+echo "dnscrypt-proxy    : $(systemctl is-active dnscrypt-proxy)"
+echo "named             : $(systemctl is-active named 2>/dev/null || echo N/A)"
+echo "DNSCrypt port     : $DNSCRYPT_PORT"
+echo
+echo "Backup:"
+echo "  /etc/resolv.conf.bak.${STAMP}"
+[ "$MODE" = "BIND" ] && echo "  /etc/named.conf.bak.${STAMP}"
+echo
+echo "Test:"
+echo "  dig google.com"
+echo "  curl -4 -I https://github.com"
+echo
